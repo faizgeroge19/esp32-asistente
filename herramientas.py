@@ -216,11 +216,14 @@ def buscar_en_internet(consulta: str, solo_noticias: bool = False) -> dict:
     cuerpo = {
         "query": consulta,
         "search_depth": "basic",
-        "max_results": 3,
+        "max_results": 5,
         "include_answer": "basic",
     }
     if solo_noticias:
         cuerpo.update({"topic": "news", "time_range": "week"})
+    else:
+        # Sin esto "Nacional" devolvía el de Uruguay; Tavily solo admite country con topic general
+        cuerpo["country"] = "colombia"
     respuesta = httpx.post(TAVILY_URL, json=cuerpo,
                            headers={"Authorization": f"Bearer {clave}"}, timeout=20)
     respuesta.raise_for_status()
