@@ -1,14 +1,18 @@
-"""Herramientas MCP de Alexa: fecha/hora, clima de Itagüí, Wikipedia y búsqueda web.
+"""Herramientas MCP de Alexa: fecha/hora, clima de Itagüí, Wikipedia, búsqueda web,
+calendario de iCloud y notas/pendientes.
 
 Se ejecuta como servidor MCP por stdio; conector.py lo une al punto de acceso de xiaozhi.me.
 Prueba local sin conexión: python herramientas.py --probar
 """
+import json
 import logging
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import caldav
 import httpx
 from dotenv import load_dotenv
 from fastmcp import FastMCP
@@ -28,6 +32,10 @@ USER_AGENT = f"AlexaESP32/1.0 ({CONTACTO_WIKIPEDIA}; asistente de voz personal)"
 WIKIPEDIA_API = "https://es.wikipedia.org/w/api.php"
 WIKIPEDIA_RESUMEN = "https://es.wikipedia.org/api/rest_v1/page/summary/"
 TAVILY_URL = "https://api.tavily.com/search"
+ICLOUD_CALDAV = "https://caldav.icloud.com"
+# Calendario de iCloud donde se crean los eventos nuevos
+CALENDARIO_PREDETERMINADO = os.environ.get("ICLOUD_CALENDARIO", "Home")
+ARCHIVO_NOTAS = Path(__file__).with_name("datos") / "notas.json"
 
 DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
 MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
@@ -53,7 +61,7 @@ logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s H
 log = logging.getLogger("herramientas")
 
 
-def _fecha_en_palabras(momento: datetime) -> str:
+def _fecha_en_palabras(momento: date) -> str:
     return f"{DIAS[momento.weekday()]} {momento.day} de {MESES[momento.month - 1]} de {momento.year}"
 
 
@@ -237,6 +245,157 @@ def buscar_en_internet(consulta: str, solo_noticias: bool = False) -> dict:
             for r in datos.get("results", [])
         ],
     }
+
+
+def _calendarios_icloud() -> list:
+    usuario = os.environ.get("ICLOUD_USUARIO", "").strip()
+    clave = os.environ.get("ICLOUD_CLAVE_APP", "").strip()
+    if not usuario or not clave:
+        raise RuntimeError("El calendario no está configurado (faltan ICLOUD_USUARIO o ICLOUD_CLAVE_APP).")
+    cliente = caldav.DAVClient(url=ICLOUD_CALDAV, username=usuario, password=clave)
+    # La lista "Reminders" es de tareas (VTODO), no de eventos
+    return [c for c in cliente.principal().calendars()
+            if "VEVENT" in c.get_supported_components()]
+
+
+def _interpretar_dia(texto: str) -> date:
+    texto = texto.strip().lower()
+    hoy = datetime.now(ZONA).date()
+    relativos = {"hoy": 0, "mañana": 1, "manana": 1, "pasado mañana": 2, "pasado manana": 2}
+    if texto in relativos:
+        return hoy + timedelta(days=relativos[texto])
+    return date.fromisoformat(texto)
+
+
+def _a_zona(valor):
+    if isinstance(valor, datetime):
+        return valor.replace(tzinfo=ZONA) if valor.tzinfo is None else valor.astimezone(ZONA)
+    return valor  # evento de todo el día: es una fecha sin hora
+
+
+@mcp.tool()
+def ver_agenda(dia: str = "hoy", dias: int = 1) -> dict:
+    """Lee los eventos del calendario de iCloud de Samuel (citas, gym, planes).
+    Úsala cuando pregunte qué tiene hoy, mañana, un día concreto o esta semana.
+    dia: "hoy", "mañana", "pasado mañana" o una fecha AAAA-MM-DD (calcúlala con obtener_fecha_hora).
+    dias: cuántos días mostrar desde ese día (1 a 7).
+    Sus clases de la universidad NO están aquí: están en la sección "Sobre Samuel" de tus instrucciones."""
+    try:
+        inicio = _interpretar_dia(dia)
+    except ValueError:
+        return {"error": f"No entendí el día «{dia}». Usa hoy, mañana o AAAA-MM-DD."}
+    dias = max(1, min(dias, 7))
+    desde = datetime.combine(inicio, datetime.min.time(), ZONA)
+    hasta = desde + timedelta(days=dias)
+
+    eventos = []
+    for calendario in _calendarios_icloud():
+        for evento in calendario.search(start=desde, end=hasta, event=True, expand=True):
+            componente = evento.icalendar_component
+            empieza = _a_zona(componente.get("dtstart").dt)
+            termina = _a_zona(componente.get("dtend").dt) if componente.get("dtend") else None
+            todo_el_dia = not isinstance(empieza, datetime)
+            eventos.append({
+                "orden": empieza.isoformat(),
+                "titulo": str(componente.get("summary", "(sin título)")),
+                "dia": _fecha_en_palabras(empieza),
+                "hora": "todo el día" if todo_el_dia else (
+                    _hora_en_palabras(empieza) + (f" a {_hora_en_palabras(termina)}" if termina else "")),
+                "lugar": str(componente.get("location", "")) or None,
+            })
+    eventos.sort(key=lambda e: e.pop("orden"))
+    log.info("ver_agenda(%s, %d días) -> %d eventos", inicio, dias, len(eventos))
+    return {
+        "desde": _fecha_en_palabras(desde),
+        "dias": dias,
+        "eventos": eventos,
+        "nota": "Si no hay eventos, díselo; recuerda que sus clases están en tus instrucciones.",
+    }
+
+
+@mcp.tool()
+def agendar_evento(titulo: str, fecha: str, hora_inicio: str = "",
+                   duracion_minutos: int = 60, lugar: str = "") -> dict:
+    """Crea un evento en el calendario de iCloud de Samuel (se ve en su iPhone).
+    ANTES de usarla, confirma en voz alta con Samuel el título, el día y la hora, y úsala solo
+    cuando diga que sí. fecha: AAAA-MM-DD, "hoy" o "mañana" (calcula las demás con
+    obtener_fecha_hora). hora_inicio: HH:MM en formato de 24 horas, o vacío para todo el día."""
+    try:
+        dia = _interpretar_dia(fecha)
+    except ValueError:
+        return {"error": f"No entendí la fecha «{fecha}». Usa AAAA-MM-DD."}
+    calendarios = _calendarios_icloud()
+    destino = next((c for c in calendarios if c.get_display_name() == CALENDARIO_PREDETERMINADO),
+                   calendarios[0])
+
+    if hora_inicio:
+        try:
+            hora, minuto = (int(parte) for parte in hora_inicio.split(":"))
+        except ValueError:
+            return {"error": f"No entendí la hora «{hora_inicio}». Usa HH:MM, por ejemplo 16:30."}
+        empieza = datetime.combine(dia, datetime.min.time(), ZONA).replace(hour=hora, minute=minuto)
+        termina = empieza + timedelta(minutes=max(5, duracion_minutos))
+        cuando = f"{_fecha_en_palabras(empieza)}, de {_hora_en_palabras(empieza)} a {_hora_en_palabras(termina)}"
+    else:
+        empieza, termina = dia, dia + timedelta(days=1)
+        cuando = f"{_fecha_en_palabras(dia)}, todo el día"
+
+    propiedades = {"dtstart": empieza, "dtend": termina, "summary": titulo}
+    if lugar:
+        propiedades["location"] = lugar
+    destino.save_event(**propiedades)
+    log.info("agendar_evento(%r, %s) -> calendario %s", titulo, cuando, destino.get_display_name())
+    return {"creado": True, "titulo": titulo, "cuando": cuando,
+            "calendario": destino.get_display_name()}
+
+
+def _leer_notas() -> list:
+    if not ARCHIVO_NOTAS.exists():
+        return []
+    return json.loads(ARCHIVO_NOTAS.read_text(encoding="utf-8"))
+
+
+def _guardar_notas(notas: list) -> None:
+    ARCHIVO_NOTAS.parent.mkdir(exist_ok=True)
+    ARCHIVO_NOTAS.write_text(json.dumps(notas, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+@mcp.tool()
+def anotar_pendiente(texto: str) -> dict:
+    """Guarda una nota o pendiente de Samuel (compras, tareas, ideas, cosas por recordar).
+    Úsala cuando diga "anota", "apunta", "recuérdame que debo...", "agrega a mi lista"."""
+    notas = _leer_notas()
+    numero = max((n["numero"] for n in notas), default=0) + 1
+    notas.append({"numero": numero, "texto": texto.strip(),
+                  "creada": datetime.now(ZONA).isoformat(timespec="minutes"), "hecha": False})
+    _guardar_notas(notas)
+    log.info("anotar_pendiente(%r) -> #%d", texto, numero)
+    return {"guardada": True, "numero": numero, "texto": texto.strip()}
+
+
+@mcp.tool()
+def ver_pendientes() -> dict:
+    """Lista las notas y pendientes de Samuel que aún no ha marcado como hechos.
+    Úsala cuando pregunte qué tiene pendiente, qué anotó o qué hay en su lista."""
+    pendientes = [{"numero": n["numero"], "texto": n["texto"]}
+                  for n in _leer_notas() if not n["hecha"]]
+    log.info("ver_pendientes -> %d", len(pendientes))
+    return {"pendientes": pendientes, "total": len(pendientes)}
+
+
+@mcp.tool()
+def completar_pendiente(numero: int) -> dict:
+    """Marca como hecho un pendiente (lo tacha de la lista). Usa el número que devuelve
+    ver_pendientes; si no lo sabes, llama primero a ver_pendientes para encontrarlo."""
+    notas = _leer_notas()
+    for nota in notas:
+        if nota["numero"] == numero and not nota["hecha"]:
+            nota["hecha"] = True
+            nota["completada"] = datetime.now(ZONA).isoformat(timespec="minutes")
+            _guardar_notas(notas)
+            log.info("completar_pendiente(#%d) -> %r", numero, nota["texto"])
+            return {"completado": True, "texto": nota["texto"]}
+    return {"completado": False, "mensaje": f"No hay un pendiente abierto con el número {numero}."}
 
 
 if __name__ == "__main__":
