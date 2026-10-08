@@ -3,6 +3,7 @@
 Se ejecuta como servidor MCP por stdio; conector.py lo une al punto de acceso de xiaozhi.me.
 Prueba local sin conexión: python herramientas.py --probar
 """
+import logging
 import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -37,6 +38,9 @@ CLIMA_WMO = {
 }
 
 mcp = FastMCP("Alexa")
+# stdout es el canal MCP: los logs van a stderr, que conector.py reenvía a su registro
+logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s HERRAMIENTA %(message)s")
+log = logging.getLogger("herramientas")
 
 
 def _fecha_en_palabras(momento: datetime) -> str:
@@ -49,6 +53,7 @@ def obtener_fecha_hora() -> dict:
     Úsala SIEMPRE que pregunten qué día es, la fecha, la hora, o necesites saber el día actual
     (por ejemplo para calcular cuánto falta para algo). No adivines la fecha."""
     ahora = datetime.now(ZONA)
+    log.info("obtener_fecha_hora -> %s", ahora.isoformat(timespec="minutes"))
     return {
         "fecha": _fecha_en_palabras(ahora),
         "hora": ahora.strftime("%I:%M %p").lstrip("0").replace("AM", "a. m.").replace("PM", "p. m."),
@@ -82,6 +87,7 @@ def consultar_clima() -> dict:
 
     actual = datos["current"]
     diario = datos["daily"]
+    log.info("consultar_clima -> %s °C, código %s", actual["temperature_2m"], actual["weather_code"])
     nombres = ["hoy", "mañana", "pasado mañana"]
     pronostico = []
     for i, nombre in enumerate(nombres):
