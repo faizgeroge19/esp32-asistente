@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 import caldav
 import httpx
+import psycopg
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 
@@ -36,6 +37,7 @@ ICLOUD_CALDAV = "https://caldav.icloud.com"
 # Calendario de iCloud donde se crean los eventos nuevos
 CALENDARIO_PREDETERMINADO = os.environ.get("ICLOUD_CALENDARIO", "Home")
 ARCHIVO_NOTAS = Path(__file__).with_name("datos") / "notas.json"
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
 MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
@@ -349,13 +351,28 @@ def agendar_evento(titulo: str, fecha: str, hora_inicio: str = "",
             "calendario": destino.get_display_name()}
 
 
-def _leer_notas() -> list:
+# Las notas viven en PostgreSQL (Neon) si hay DATABASE_URL; si no, en un archivo local.
+# En Render no sirve el archivo: el plan gratis borra el disco en cada reinicio.
+def _bd():
+    conexion = psycopg.connect(DATABASE_URL, connect_timeout=15)
+    conexion.execute("""
+        CREATE TABLE IF NOT EXISTS notas (
+            numero     SERIAL PRIMARY KEY,
+            texto      TEXT NOT NULL,
+            creada     TIMESTAMPTZ NOT NULL DEFAULT now(),
+            hecha      BOOLEAN NOT NULL DEFAULT false,
+            completada TIMESTAMPTZ
+        )""")
+    return conexion
+
+
+def _leer_archivo() -> list:
     if not ARCHIVO_NOTAS.exists():
         return []
     return json.loads(ARCHIVO_NOTAS.read_text(encoding="utf-8"))
 
 
-def _guardar_notas(notas: list) -> None:
+def _guardar_archivo(notas: list) -> None:
     ARCHIVO_NOTAS.parent.mkdir(exist_ok=True)
     ARCHIVO_NOTAS.write_text(json.dumps(notas, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -364,21 +381,33 @@ def _guardar_notas(notas: list) -> None:
 def anotar_pendiente(texto: str) -> dict:
     """Guarda una nota o pendiente de Samuel (compras, tareas, ideas, cosas por recordar).
     Úsala cuando diga "anota", "apunta", "recuérdame que debo...", "agrega a mi lista"."""
-    notas = _leer_notas()
-    numero = max((n["numero"] for n in notas), default=0) + 1
-    notas.append({"numero": numero, "texto": texto.strip(),
-                  "creada": datetime.now(ZONA).isoformat(timespec="minutes"), "hecha": False})
-    _guardar_notas(notas)
+    texto = texto.strip()
+    if DATABASE_URL:
+        with _bd() as conexion:
+            numero = conexion.execute(
+                "INSERT INTO notas (texto) VALUES (%s) RETURNING numero", (texto,)).fetchone()[0]
+    else:
+        notas = _leer_archivo()
+        numero = max((n["numero"] for n in notas), default=0) + 1
+        notas.append({"numero": numero, "texto": texto,
+                      "creada": datetime.now(ZONA).isoformat(timespec="minutes"), "hecha": False})
+        _guardar_archivo(notas)
     log.info("anotar_pendiente(%r) -> #%d", texto, numero)
-    return {"guardada": True, "numero": numero, "texto": texto.strip()}
+    return {"guardada": True, "numero": numero, "texto": texto}
 
 
 @mcp.tool()
 def ver_pendientes() -> dict:
     """Lista las notas y pendientes de Samuel que aún no ha marcado como hechos.
     Úsala cuando pregunte qué tiene pendiente, qué anotó o qué hay en su lista."""
-    pendientes = [{"numero": n["numero"], "texto": n["texto"]}
-                  for n in _leer_notas() if not n["hecha"]]
+    if DATABASE_URL:
+        with _bd() as conexion:
+            filas = conexion.execute(
+                "SELECT numero, texto FROM notas WHERE NOT hecha ORDER BY numero").fetchall()
+        pendientes = [{"numero": numero, "texto": texto} for numero, texto in filas]
+    else:
+        pendientes = [{"numero": n["numero"], "texto": n["texto"]}
+                      for n in _leer_archivo() if not n["hecha"]]
     log.info("ver_pendientes -> %d", len(pendientes))
     return {"pendientes": pendientes, "total": len(pendientes)}
 
@@ -387,15 +416,26 @@ def ver_pendientes() -> dict:
 def completar_pendiente(numero: int) -> dict:
     """Marca como hecho un pendiente (lo tacha de la lista). Usa el número que devuelve
     ver_pendientes; si no lo sabes, llama primero a ver_pendientes para encontrarlo."""
-    notas = _leer_notas()
-    for nota in notas:
-        if nota["numero"] == numero and not nota["hecha"]:
-            nota["hecha"] = True
-            nota["completada"] = datetime.now(ZONA).isoformat(timespec="minutes")
-            _guardar_notas(notas)
-            log.info("completar_pendiente(#%d) -> %r", numero, nota["texto"])
-            return {"completado": True, "texto": nota["texto"]}
-    return {"completado": False, "mensaje": f"No hay un pendiente abierto con el número {numero}."}
+    texto = None
+    if DATABASE_URL:
+        with _bd() as conexion:
+            fila = conexion.execute(
+                "UPDATE notas SET hecha = true, completada = now() "
+                "WHERE numero = %s AND NOT hecha RETURNING texto", (numero,)).fetchone()
+        texto = fila[0] if fila else None
+    else:
+        notas = _leer_archivo()
+        for nota in notas:
+            if nota["numero"] == numero and not nota["hecha"]:
+                nota["hecha"] = True
+                nota["completada"] = datetime.now(ZONA).isoformat(timespec="minutes")
+                _guardar_archivo(notas)
+                texto = nota["texto"]
+                break
+    if texto is None:
+        return {"completado": False, "mensaje": f"No hay un pendiente abierto con el número {numero}."}
+    log.info("completar_pendiente(#%d) -> %r", numero, texto)
+    return {"completado": True, "texto": texto}
 
 
 if __name__ == "__main__":
