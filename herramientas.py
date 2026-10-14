@@ -27,7 +27,7 @@ if sys.platform == "win32":
 ZONA = ZoneInfo("America/Bogota")
 CIUDAD = "Itagüí"
 LATITUD, LONGITUD = 6.172, -75.611
-# Wikimedia exige un User-Agent con contacto (URL o correo); sin él responde 403
+# Wikimedia y MET Norway exigen un User-Agent con contacto (URL o correo); sin él responden 403
 CONTACTO_WIKIPEDIA = os.environ.get("CONTACTO_WIKIPEDIA", "").strip()
 USER_AGENT = f"AlexaESP32/1.0 ({CONTACTO_WIKIPEDIA}; asistente de voz personal)"
 WIKIPEDIA_API = "https://es.wikipedia.org/w/api.php"
@@ -86,12 +86,30 @@ def obtener_fecha_hora() -> dict:
     }
 
 
-@mcp.tool()
-def consultar_clima() -> dict:
-    """Devuelve el clima actual y el pronóstico de hoy, mañana y pasado mañana en Itagüí, Colombia
-    (área metropolitana de Medellín), con temperaturas en grados Celsius y probabilidad de lluvia.
-    Úsala SIEMPRE que pregunten por el clima, la temperatura, si va a llover o si llevar paraguas.
-    No inventes datos del clima."""
+# Clima: Open-Meteo limita por IP y en Render la IP es compartida (responde 429), así que
+# MET Norway queda de respaldo. Ambos se normalizan al mismo formato y se cachean 15 min.
+CACHE_CLIMA_MINUTOS = 15
+_cache_clima = {"momento": None, "datos": None}
+
+# Símbolos de MET Norway (sin el sufijo _day/_night), del más al menos severo
+CLIMA_METNO = [
+    ("thunder", "tormenta eléctrica"), ("heavyrain", "lluvia fuerte"), ("sleet", "aguanieve"),
+    ("snow", "nieve"), ("lightrainshowers", "chubascos ligeros"), ("rainshowers", "chubascos"),
+    ("lightrain", "lluvia ligera"), ("rain", "lluvia"), ("fog", "niebla"),
+    ("partlycloudy", "parcialmente nublado"), ("cloudy", "nublado"),
+    ("fair", "mayormente despejado"), ("clearsky", "despejado"),
+]
+
+
+def _estado_metno(simbolo: str) -> tuple[int, str]:
+    """Devuelve (severidad, descripción); menor severidad = peor clima."""
+    for severidad, (clave, descripcion) in enumerate(CLIMA_METNO):
+        if clave in simbolo:
+            return severidad, descripcion
+    return len(CLIMA_METNO), "desconocido"
+
+
+def _pronostico_open_meteo() -> dict:
     respuesta = httpx.get(
         "https://api.open-meteo.com/v1/forecast",
         params={
@@ -101,6 +119,7 @@ def consultar_clima() -> dict:
                        "precipitation,weather_code,wind_speed_10m",
             "daily": "weather_code,temperature_2m_max,temperature_2m_min,"
                      "precipitation_probability_max,precipitation_sum",
+            "hourly": "precipitation_probability,precipitation",
             "timezone": "America/Bogota",
             "forecast_days": 3,
         },
@@ -108,27 +127,10 @@ def consultar_clima() -> dict:
     )
     respuesta.raise_for_status()
     datos = respuesta.json()
-
-    actual = datos["current"]
-    diario = datos["daily"]
-    log.info("consultar_clima -> %s °C, código %s", actual["temperature_2m"], actual["weather_code"])
-    nombres = ["hoy", "mañana", "pasado mañana"]
-    pronostico = []
-    for i, nombre in enumerate(nombres):
-        dia = datetime.fromisoformat(diario["time"][i])
-        pronostico.append({
-            "dia": f"{nombre} ({_fecha_en_palabras(dia)})",
-            "estado": CLIMA_WMO.get(diario["weather_code"][i], "desconocido"),
-            "minima_c": round(diario["temperature_2m_min"][i]),
-            "maxima_c": round(diario["temperature_2m_max"][i]),
-            "probabilidad_lluvia_pct": diario["precipitation_probability_max"][i],
-            "lluvia_mm": diario["precipitation_sum"][i],
-        })
-
+    actual, diario, horario = datos["current"], datos["daily"], datos["hourly"]
     return {
-        "ciudad": CIUDAD,
+        "fuente": "Open-Meteo",
         "actual": {
-            "hora_medicion": actual["time"],
             "estado": CLIMA_WMO.get(actual["weather_code"], "desconocido"),
             "temperatura_c": round(actual["temperature_2m"]),
             "sensacion_termica_c": round(actual["apparent_temperature"]),
@@ -136,49 +138,141 @@ def consultar_clima() -> dict:
             "lloviendo_ahora_mm": actual["precipitation"],
             "viento_kmh": round(actual["wind_speed_10m"]),
         },
-        "pronostico": pronostico,
-        "fuente": "Open-Meteo",
+        "dias": [{
+            "fecha": date.fromisoformat(diario["time"][i]),
+            "estado": CLIMA_WMO.get(diario["weather_code"][i], "desconocido"),
+            "minima_c": round(diario["temperature_2m_min"][i]),
+            "maxima_c": round(diario["temperature_2m_max"][i]),
+            "probabilidad_lluvia_pct": diario["precipitation_probability_max"][i],
+            "lluvia_mm": diario["precipitation_sum"][i],
+        } for i in range(3)],
+        "horas": [(datetime.fromisoformat(momento).replace(tzinfo=ZONA), probabilidad, milimetros)
+                  for momento, probabilidad, milimetros in zip(
+                      horario["time"], horario["precipitation_probability"], horario["precipitation"])],
+    }
+
+
+def _pronostico_met_norway() -> dict:
+    respuesta = httpx.get(
+        "https://api.met.no/weatherapi/locationforecast/2.0/compact",
+        params={"lat": LATITUD, "lon": LONGITUD},
+        headers={"User-Agent": USER_AGENT},  # MET Norway exige identificación con contacto
+        timeout=10,
+    )
+    respuesta.raise_for_status()
+    serie = respuesta.json()["properties"]["timeseries"]
+
+    horas, por_dia = [], {}
+    for punto in serie:
+        momento = datetime.fromisoformat(punto["time"].replace("Z", "+00:00")).astimezone(ZONA)
+        datos = punto["data"]
+        # Las primeras ~2,5 días vienen hora a hora; después, en bloques de 6 horas
+        bloque = datos.get("next_1_hours") or datos.get("next_6_hours") or {}
+        milimetros = bloque.get("details", {}).get("precipitation_amount", 0.0)
+        simbolo = bloque.get("summary", {}).get("symbol_code", "")
+        if "next_1_hours" in datos:
+            horas.append((momento, None, milimetros))
+        dia = por_dia.setdefault(momento.date(), {"temperaturas": [], "lluvia": 0.0, "peor": None})
+        dia["temperaturas"].append(datos["instant"]["details"]["air_temperature"])
+        dia["lluvia"] += milimetros
+        if simbolo and 6 <= momento.hour <= 18:
+            estado = _estado_metno(simbolo)
+            dia["peor"] = min(dia["peor"] or estado, estado)
+
+    primero = serie[0]["data"]
+    instante = primero["instant"]["details"]
+    proxima = primero.get("next_1_hours", {})
+    hoy = datetime.now(ZONA).date()
+    return {
+        "fuente": "MET Norway (yr.no)",
+        "actual": {
+            "estado": _estado_metno(proxima.get("summary", {}).get("symbol_code", ""))[1],
+            "temperatura_c": round(instante["air_temperature"]),
+            "sensacion_termica_c": None,
+            "humedad_pct": round(instante["relative_humidity"]),
+            "lloviendo_ahora_mm": proxima.get("details", {}).get("precipitation_amount", 0.0),
+            "viento_kmh": round(instante["wind_speed"] * 3.6),
+        },
+        "dias": [{
+            "fecha": fecha,
+            "estado": (por_dia[fecha]["peor"] or (0, "desconocido"))[1],
+            "minima_c": round(min(por_dia[fecha]["temperaturas"])),
+            "maxima_c": round(max(por_dia[fecha]["temperaturas"])),
+            "probabilidad_lluvia_pct": None,
+            "lluvia_mm": round(por_dia[fecha]["lluvia"], 1),
+        } for fecha in (hoy + timedelta(days=i) for i in range(3)) if fecha in por_dia],
+        "horas": horas,
+    }
+
+
+def _pronostico() -> dict:
+    ahora = datetime.now(ZONA)
+    if (_cache_clima["datos"]
+            and ahora - _cache_clima["momento"] < timedelta(minutes=CACHE_CLIMA_MINUTOS)):
+        return _cache_clima["datos"]
+    errores = []
+    for proveedor in (_pronostico_open_meteo, _pronostico_met_norway):
+        try:
+            datos = proveedor()
+        except (httpx.HTTPError, KeyError, ValueError) as error:
+            errores.append(f"{proveedor.__name__}: {error}")
+            log.warning("Clima: %s falló (%s)", proveedor.__name__, error)
+            continue
+        _cache_clima.update(momento=ahora, datos=datos)
+        return datos
+    raise RuntimeError("Ningún servicio de clima respondió: " + " | ".join(errores))
+
+
+@mcp.tool()
+def consultar_clima() -> dict:
+    """Devuelve el clima actual y el pronóstico de hoy, mañana y pasado mañana en Itagüí, Colombia
+    (área metropolitana de Medellín), con temperaturas en grados Celsius y lluvia esperada.
+    Úsala SIEMPRE que pregunten por el clima, la temperatura, si va a llover o si llevar paraguas.
+    No inventes datos del clima."""
+    try:
+        datos = _pronostico()
+    except RuntimeError as error:
+        return {"error": f"No pude consultar el clima ahora mismo. {error}"}
+    nombres = ["hoy", "mañana", "pasado mañana"]
+    log.info("consultar_clima -> %s °C (%s)", datos["actual"]["temperatura_c"], datos["fuente"])
+    return {
+        "ciudad": CIUDAD,
+        "actual": datos["actual"],
+        "pronostico": [{**dia, "fecha": f"{nombre} ({_fecha_en_palabras(dia['fecha'])})"}
+                       for nombre, dia in zip(nombres, datos["dias"])],
+        "fuente": datos["fuente"],
+        "nota": "probabilidad_lluvia_pct es null cuando la fuente no la da; usa entonces lluvia_mm",
     }
 
 
 @mcp.tool()
 def lluvia_por_horas(dia: str = "hoy") -> dict:
-    """Devuelve, hora por hora, la probabilidad de lluvia y los milímetros esperados en Itagüí.
-    Úsala cuando pregunten A QUÉ HORA va a llover, hasta qué hora llueve, o si puede salir
-    a cierta hora sin mojarse. dia: "hoy" (desde la hora actual) o "mañana"."""
+    """Devuelve, hora por hora, la lluvia esperada en Itagüí (milímetros y, si la fuente la da,
+    probabilidad). Úsala cuando pregunten A QUÉ HORA va a llover, hasta qué hora llueve, o si
+    puede salir a cierta hora sin mojarse. dia: "hoy" (desde la hora actual) o "mañana"."""
     manana = dia.strip().lower() in ("mañana", "manana", "tomorrow")
-    respuesta = httpx.get(
-        "https://api.open-meteo.com/v1/forecast",
-        params={
-            "latitude": LATITUD,
-            "longitude": LONGITUD,
-            "hourly": "precipitation_probability,precipitation",
-            "timezone": "America/Bogota",
-            "forecast_days": 2,
-        },
-        timeout=10,
-    )
-    respuesta.raise_for_status()
-    horario = respuesta.json()["hourly"]
+    try:
+        datos = _pronostico()
+    except RuntimeError as error:
+        return {"error": f"No pude consultar la lluvia ahora mismo. {error}"}
 
     ahora = datetime.now(ZONA)
     fecha_objetivo = (ahora + timedelta(days=1) if manana else ahora).date()
     horas = []
-    for momento_iso, probabilidad, milimetros in zip(
-            horario["time"], horario["precipitation_probability"], horario["precipitation"]):
-        momento = datetime.fromisoformat(momento_iso).replace(tzinfo=ZONA)
-        if momento.date() != fecha_objetivo:
+    for momento, probabilidad, milimetros in datos["horas"]:
+        if momento.date() != fecha_objetivo or (not manana and momento.hour < ahora.hour):
             continue
-        if not manana and momento.hour < ahora.hour:
-            continue
-        horas.append(f"{_hora_en_palabras(momento)}: {probabilidad}% ({milimetros} mm)")
+        probabilidad_texto = f"{probabilidad}%, " if probabilidad is not None else ""
+        horas.append(f"{_hora_en_palabras(momento)}: {probabilidad_texto}{milimetros} mm")
 
-    log.info("lluvia_por_horas(%s) -> %d horas", "mañana" if manana else "hoy", len(horas))
+    log.info("lluvia_por_horas(%s) -> %d horas (%s)",
+             "mañana" if manana else "hoy", len(horas), datos["fuente"])
     return {
         "ciudad": CIUDAD,
-        "dia": f"{'mañana' if manana else 'hoy'} ({_fecha_en_palabras(ahora + timedelta(days=int(manana)))})",
+        "dia": f"{'mañana' if manana else 'hoy'} ({_fecha_en_palabras(fecha_objetivo)})",
         "horas": horas,
-        "nota": "probabilidad de lluvia y milímetros por hora; 0.1 mm o menos es llovizna casi imperceptible",
+        "fuente": datos["fuente"],
+        "nota": "milímetros por hora; 0.1 mm o menos es llovizna casi imperceptible",
     }
 
 
